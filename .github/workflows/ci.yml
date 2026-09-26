@@ -21,7 +21,7 @@ jobs:
           --health-retries 5
     strategy:
       matrix:
-        node-version: [18, 20]
+        node-version: [18, 20, 22]
     steps:
       - uses: actions/checkout@v4
 
@@ -34,8 +34,27 @@ jobs:
 
       - run: pnpm install --frozen-lockfile
       - run: pnpm run build
+      # @netiflyjs/client's build/typecheck only need `lib: ["ES2020", "DOM"]`
+      # at compile time, which is a type-only concern — they're independent of
+      # the Node version running tsc, so these stay unfiltered on every leg.
       - run: pnpm run lint
       - run: pnpm run typecheck
-      - run: pnpm run test
+
+      - name: Bundle size check (@netiflyjs/client)
+        if: matrix.node-version == 22
+        run: pnpm --filter @netiflyjs/client run size
+
+      # Running @netiflyjs/client's jest suite needs a real global WebSocket,
+      # which Node only ships unflagged from 22 — on 18/20 it would throw a
+      # ReferenceError, so those legs run core + express only.
+      - name: Test (core, express)
+        if: matrix.node-version != 22
+        run: pnpm --filter '!@netiflyjs/client' run test
+        env:
+          REDIS_URL: redis://127.0.0.1:6379
+
+      - name: Test (all packages, incl. client — needs Node 22+ for global WebSocket)
+        if: matrix.node-version == 22
+        run: pnpm run test
         env:
           REDIS_URL: redis://127.0.0.1:6379

@@ -20,6 +20,7 @@ Framework-agnostic, real-time per-user notifications for Node.js servers — Web
 
 - 🔌 **Framework-agnostic core** — attaches to any Node `http.Server`, so it works under Express, Fastify, Koa, NestJS, or raw `http`.
 - ⚡ **Express adapter** (`@netiflyjs/express`) for a one-line setup.
+- 📱 **Client SDK** (`@netiflyjs/client`) — ~1.7 KB gzipped, zero dependencies, standard `WebSocket` (browser, React Native, Node 22+), with reconnect-with-full-jitter-backoff and typed handlers built in.
 - 🔁 **Horizontally scalable** — any number of server instances stay in sync through Redis pub/sub, no sticky sessions required.
 - 🔐 **Auth-agnostic** — you supply a `resolveUserId` function; Netifly doesn't care how you authenticate.
 - 💓 **Dead-connection reaping** — a ping/pong heartbeat terminates clients that silently disappeared.
@@ -43,6 +44,8 @@ Netifly is deliberately narrow: no rooms, no presence, no broadcast — just "de
 npm install @netiflyjs/core
 # or, for Express apps:
 npm install @netiflyjs/core @netiflyjs/express
+# and, in your frontend (or any WebSocket client):
+npm install @netiflyjs/client
 ```
 
 ## 🚀 Quickstart
@@ -130,7 +133,7 @@ netifly.send(userId, 'export.ready', { url: 123 });   // ❌ type error: wrong p
 netifly.send(userId, 'not.a.real.event', {});          // ❌ type error: unknown event name
 ```
 
-`Events` is a plain, exported `EventMap` (`Record<string, unknown>`) — nothing core-specific — so the exact same type can be shared with a client-side package (e.g. a future `@netiflyjs/react`) for typed handlers on the receiving end. `createNetiflyPublisher<Events>()` supports the identical pattern (see [Sending from workers / other languages](#-sending-from-workers--other-languages) below). Calling `createNetifly()`/`createNetiflyPublisher()` with no type argument still works exactly as before — every `type` string and `data` shape is accepted, since `Events` defaults to `Record<string, unknown>`.
+`Events` is a plain, exported `EventMap` (`Record<string, unknown>`) — nothing core-specific — so the exact same type can be shared with the client side for typed handlers on the receiving end (see [Client SDK](#-client-sdk--netiflyjsclient)). `createNetiflyPublisher<Events>()` supports the identical pattern (see [Sending from workers / other languages](#-sending-from-workers--other-languages) below). Calling `createNetifly()`/`createNetiflyPublisher()` with no type argument still works exactly as before — every `type` string and `data` shape is accepted, since `Events` defaults to `Record<string, unknown>`.
 
 For runtime enforcement (e.g. with [Zod](https://zod.dev) or [Valibot](https://valibot.dev)), pass a `validate` function:
 
@@ -152,6 +155,112 @@ const netifly = createNetifly<Events>({
 ```
 
 `validate` is called with the exact `(type, data)` pair for every `send()`/`sendOr()` call, before the envelope is built or published. Throwing from `validate` aborts the send — nothing is published, and the error propagates straight out of the `send()`/`sendOr()` call (it's not caught or wrapped). Omit `validate` entirely and behavior is unchanged from before this option existed.
+
+## 📱 Client SDK — `@netiflyjs/client`
+
+Without a client, every adopter hand-rolls reconnect logic. `@netiflyjs/client` is the receiving end of everything above: **zero runtime dependencies**, ~1.7 KB minified + gzipped, and built on the standard `WebSocket` global — so it runs unchanged in browsers, React Native, and Node 22+ (the first Node release with `WebSocket` available unflagged, hence this package's `engines: { node: ">=22" }` — the rest of the repo still supports Node 18+).
+
+```bash
+npm install @netiflyjs/client
+```
+
+### Quickstart
+
+```ts
+import { createNetiflyClient } from '@netiflyjs/client';
+
+// The same Events map your server passes to createNetifly<Events>()
+type Events = {
+  'comment.created': { commentId: string };
+  'export.ready': { url: string };
+};
+
+const client = createNetiflyClient<Events>({
+  url: 'wss://api.example.com/netifly',
+  getToken: () => session.accessToken, // may be async; called on every (re)connect
+});
+
+// Application events — typed against Events
+client.on('export.ready', ({ url }) => {   // ✅ url: string
+  toast(`Your export is ready: ${url}`);
+});
+
+// Client lifecycle — deliberately a separate channel from app events,
+// so an app event named "state" or "error" can never collide with it
+client.onStateChange((state) => {
+  // 'connecting' | 'open' | 'reconnecting' | 'closed'
+  setBanner(state === 'open' ? null : `Reconnecting…`);
+});
+
+client.connect();
+
+// …later, on logout/unmount:
+client.close(); // cancels any pending reconnect; never reconnects on its own
+```
+
+`on()` returns an unsubscribe function, so it drops straight into a React effect:
+
+```ts
+useEffect(() => client.on('comment.created', addComment), []);
+```
+
+### Reconnecting
+
+Reconnect delays use the AWS [Full Jitter](https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/) formula — `delay = random(0, min(cap, base * 2^attempt))` — so a fleet of clients coming back after an outage spreads out instead of re-stampeding the server in lockstep waves. `base` is `baseDelayMs` (default `500`) and `cap` is `maxDelayMs` (default `30_000`); the attempt counter resets on every successful connection.
+
+What a disconnect means depends on whether the connection had ever opened:
+
+| Situation | Client behavior |
+| --- | --- |
+| The handshake never completed (the very first `open` never fired) | Exponential backoff with full jitter — see the caveat below |
+| Closed with `1000` (Normal Closure) or `1005` (no status) after being open | Stays `closed`. `netifly.disconnect(userId)` on the server produces `1005`, and that's an intentional server-side disconnect, not a fault |
+| Closed with `1012` (Service Restart) after being open | Reconnects **immediately**, with a single jittered delay drawn from the base window only — no exponential ramp. This is what `netifly.close()` sends on a graceful deploy |
+| Any other close code after being open (`1001`, `1006`, `1011`, `1013`, …) | Treated as transient: exponential backoff with full jitter |
+| Your app called `client.close()` | Never reconnects, whatever close code results |
+
+> ⚠️ **A browser cannot see why a handshake failed.** Per the WHATWG WebSocket spec, a rejected upgrade gives JavaScript no access to the HTTP response: whether Netifly answered `401 Unauthorized`, `403 Forbidden` (origin check), or `429 Too Many Requests`, the client receives the exact same bare `close` event — code `1006`, `wasClean: false` — as it would for an unreachable host or dropped Wi-Fi. Browsers withhold the status deliberately (it would leak cross-origin response details), and Node's native `WebSocket` behaves identically. There is therefore **no spec-compliant way** for this client to treat `401`/`403` as terminal while retrying `429`, and it does not pretend otherwise: every never-opened failure is retried with backoff, because giving up on what was actually a network blip would strand a legitimate user offline. If your app needs auth-aware behavior, detect the invalid session over plain HTTP (where the status code *is* visible) and call `client.close()` yourself. Set `maxReconnectAttempts` if you'd rather the client eventually give up on its own. Whatever the runtime, `onClose` reports a failed handshake as code `1006`: Node 22's bundled undici fires only an `error` event in that case (no `close` at all, unlike browsers and Node 24+), and the client normalizes the two into one close so a retry always happens.
+
+### Token auth
+
+Browsers can't set request headers on a WebSocket handshake, so a bearer token has exactly two places to go. `getToken()` is called again before **every** connection attempt, so short-lived tokens are refreshed rather than reused past expiry.
+
+**Query string (default, recommended):**
+
+```ts
+createNetiflyClient({ url: 'wss://api.example.com/netifly', getToken: () => token });
+// connects to  wss://api.example.com/netifly?token=<token>
+```
+
+Server side, `resolveUserId` reads it straight off the raw request:
+
+```ts
+resolveUserId: (req) => verifyJwt(new URL(req.url, 'http://x').searchParams.get('token')),
+```
+
+Rename the parameter with `tokenQueryParam: 'access_token'`. Keep in mind that URLs are more likely to end up in access logs than headers are — prefer short-lived tokens, and see [Cookie vs. token auth](#cookie-vs-token-auth).
+
+**Subprotocol:**
+
+```ts
+createNetiflyClient({ url, getToken: () => token, tokenMode: 'subprotocol' });
+// offers Sec-WebSocket-Protocol: netifly.token.<token>
+```
+
+```ts
+resolveUserId: (req) => {
+  const offered = req.headers['sec-websocket-protocol'];
+  const match = offered?.split(',').map((p) => p.trim()).find((p) => p.startsWith('netifly.token.'));
+  return match ? verifyJwt(match.slice('netifly.token.'.length)) : null;
+},
+```
+
+This mode **works today** against a `createNetifly()` server, verified by integration test. Some background, since RFC 6455 §4.1 says a strict client must fail the connection if the server doesn't select one of the offered subprotocols: `@netiflyjs/core` passes no `handleProtocols` option to `ws`, and `ws`'s default in that case is to echo back the *first* subprotocol the client offered — so the handshake completes and `client.protocol` reports `netifly.token.<token>`. (If core ever adds a `handleProtocols` callback, it must keep echoing a `netifly.token.*` protocol back, or this mode breaks.) Change the prefix with `tokenProtocolPrefix`. Note that a subprotocol must be a valid HTTP token — no commas or spaces — which JWTs and other base64url tokens satisfy.
+
+Omit `getToken` entirely for cookie-based auth; the browser attaches cookies to the upgrade request on its own (and then the [origin allowlist](#origin-allowlist) is what protects you from CSWSH).
+
+### Replay (`lastEventId`)
+
+`client.lastEventId` is the `id` of the most recent [envelope](#-message-envelope) received — a sortable ULID. The client tracks it but does not yet resume from it; it's here so apps can persist it now, ahead of replay-on-reconnect support.
 
 ## 🔐 Redis Configuration
 
@@ -356,6 +465,36 @@ Returns a `NetiflyPublisher<Events>` — a lighter-weight, send-only counterpart
 - `isOnline(userId): Promise<boolean>` / `whoIsOnline(userIds): Promise<Record<string, boolean>>` — identical semantics/caveats to `NetiflyInstance`'s.
 - `close(): Promise<void>` — disconnects the publisher's Redis connection. Call it before a short-lived process (e.g. a serverless invocation) exits. Calling `send()`/`isOnline()`/`whoIsOnline()` after `close()` throws `Netifly: cannot use publisher after close()`.
 
+### `createNetiflyClient<Events>(options)` — `@netiflyjs/client`
+
+The browser/Node client (see [Client SDK](#-client-sdk--netiflyjsclient)). `new NetiflyClient<Events>(options)` is the identical class form. `Events` is the same `EventMap` your server uses, so handlers are type-checked against the payloads the server sends.
+
+| Option | Type | Required | Description |
+| --- | --- | --- | --- |
+| `url` | `string` | ✅ | The Netifly WebSocket endpoint, e.g. `wss://api.example.com/netifly`. |
+| `getToken` | `() => string \| Promise<string>` | — | Resolves the auth token, called again before **every** connection attempt so short-lived tokens are refreshed. Omit for cookie-based auth. |
+| `tokenMode` | `'query' \| 'subprotocol'` | — | Where the token goes (see [Token auth](#token-auth)). Defaults to `'query'`. |
+| `tokenQueryParam` | `string` | — | Query parameter name used by `tokenMode: 'query'`. Defaults to `'token'`. |
+| `tokenProtocolPrefix` | `string` | — | Subprotocol prefix used by `tokenMode: 'subprotocol'`. Defaults to `'netifly.token.'`. |
+| `baseDelayMs` | `number` | — | Base of the full-jitter backoff. Defaults to `500`. |
+| `maxDelayMs` | `number` | — | Cap on the backoff window. Defaults to `30_000`. |
+| `maxReconnectAttempts` | `number` | — | Consecutive reconnect attempts before giving up (going `closed` and reporting an error). Defaults to `Infinity` — the right default for a long-lived app that should survive an outage of any length. |
+
+Returns a `NetiflyClient<Events>`:
+
+- `connect(): void` — opens the connection and keeps it open, reconnecting per the [table above](#reconnecting). A no-op while already open or connecting. Register handlers first so nothing is missed.
+- `close(code = 1000, reason?): void` — shuts down for good: cancels any pending reconnect timer and closes the socket. **Never** triggers a reconnect. Call `connect()` again to start over.
+- `on<K extends keyof Events & string>(type: K, handler: (data: Events[K], envelope: Envelope<Events[K]>) => void): () => void` — subscribes to one application event type; returns an unsubscribe function. The raw [envelope](#-message-envelope) is passed as a second argument when you need `id`/`ts`.
+- `onAny(handler: (envelope: Envelope) => void): () => void` — every envelope, whatever its type.
+- `onStateChange(handler: (state: ConnectionState) => void): () => void` — connection lifecycle: `'connecting'` (handshake in flight), `'open'`, `'reconnecting'` (waiting out a backoff delay), `'closed'` (down and not retrying).
+- `onClose(handler: ({ code, reason, wasClean }) => void): () => void` — the raw close event, for logging or your own policy on top.
+- `onError(handler: (error: Error) => void): () => void` — a rejected `getToken()`, an unparseable message, a throwing handler (which never breaks the other handlers), or giving up after `maxReconnectAttempts`.
+- `state: ConnectionState` — current state, same values as `onStateChange`.
+- `lastEventId: string | undefined` — `id` of the most recent envelope received, tracked for future replay support.
+- `protocol: string` — the subprotocol the server selected, or `''`.
+
+The package also exports `fullJitterDelay(attempt, base, cap)` and `planReconnect(wasOpen, code)` — the pure functions behind the behavior in the [table above](#reconnecting) — plus the `Envelope`, `EventMap`, `ConnectionState`, `CloseInfo` and `NetiflyClientOptions` types and `ENVELOPE_VERSION`. `Envelope`/`EventMap` are deliberately re-declared here rather than imported from `@netiflyjs/core` (which would pull `ws` and `ioredis` into a browser bundle); they are the same [wire contract](#-message-envelope) both sides implement.
+
 ## 🏗️ Architecture
 
 ```
@@ -375,7 +514,10 @@ pnpm install
 docker run --rm -p 6379:6379 redis:7-alpine   # tests need a local Redis
 pnpm test
 pnpm build
+pnpm --filter @netiflyjs/client run size      # bundle-size budget (after a build)
 ```
+
+`@netiflyjs/client`'s own tests spin up a real `createNetifly()` server to run against, so they need the same Redis — and **Node 22+**, since they exercise the native `WebSocket` global. On Node 18/20, run `pnpm --filter '!@netiflyjs/client' run test` instead (that's exactly what CI does on its 18 and 20 legs; the build, lint and typecheck steps are type-only and run everywhere).
 
 ## 🤝 Contributing
 
