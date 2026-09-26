@@ -113,6 +113,46 @@ await netifly.sendOr(userId, 'invoice.ready', data, {
 
 `offline` is only called — and awaited, if it returns a promise — when nobody held a live connection for `userId` anywhere in your cluster. Either way, `sendOr()` resolves with the same `SendResult` `send()` would have returned.
 
+### Typed events
+
+Give `createNetifly()` an `Events` map — event name → payload shape — and `send()`/`sendOr()` become type-checked against it:
+
+```ts
+type Events = {
+  'comment.created': { commentId: string };
+  'export.ready': { url: string };
+};
+
+const netifly = createNetifly<Events>({ server, resolveUserId });
+
+netifly.send(userId, 'export.ready', { url });        // ✅ type-checks
+netifly.send(userId, 'export.ready', { url: 123 });   // ❌ type error: wrong payload shape
+netifly.send(userId, 'not.a.real.event', {});          // ❌ type error: unknown event name
+```
+
+`Events` is a plain, exported `EventMap` (`Record<string, unknown>`) — nothing core-specific — so the exact same type can be shared with a client-side package (e.g. a future `@netiflyjs/react`) for typed handlers on the receiving end. `createNetiflyPublisher<Events>()` supports the identical pattern (see [Sending from workers / other languages](#-sending-from-workers--other-languages) below). Calling `createNetifly()`/`createNetiflyPublisher()` with no type argument still works exactly as before — every `type` string and `data` shape is accepted, since `Events` defaults to `Record<string, unknown>`.
+
+For runtime enforcement (e.g. with [Zod](https://zod.dev) or [Valibot](https://valibot.dev)), pass a `validate` function:
+
+```ts
+import { z } from 'zod';
+
+const schemas = {
+  'comment.created': z.object({ commentId: z.string() }),
+  'export.ready': z.object({ url: z.string().url() }),
+} satisfies Record<keyof Events, z.ZodTypeAny>;
+
+const netifly = createNetifly<Events>({
+  server,
+  resolveUserId,
+  validate: (type, data) => {
+    schemas[type].parse(data);
+  },
+});
+```
+
+`validate` is called with the exact `(type, data)` pair for every `send()`/`sendOr()` call, before the envelope is built or published. Throwing from `validate` aborts the send — nothing is published, and the error propagates straight out of the `send()`/`sendOr()` call (it's not caught or wrapped). Omit `validate` entirely and behavior is unchanged from before this option existed.
+
 ## 🔐 Redis Configuration
 
 Netifly requires a Redis connection string — never hardcode credentials. Provide it either as an environment variable:
@@ -259,7 +299,9 @@ rdb.Publish(context.Background(), fmt.Sprintf("netifly:user:%s", userID), envelo
 
 ## 📖 API Reference
 
-### `createNetifly(options)` — `@netiflyjs/core`
+### `createNetifly<Events>(options)` — `@netiflyjs/core`
+
+`Events` is an optional type parameter — an `EventMap` (`Record<string, unknown>`) mapping event names to payload shapes — that type-checks the `send<K>()`/`sendOr<K>()` overload below (see [Typed events](#typed-events)). Defaults to `Record<string, unknown>`, so `createNetifly(options)` with no type argument behaves exactly as it always has.
 
 | Option | Type | Required | Description |
 | --- | --- | --- | --- |
@@ -272,14 +314,15 @@ rdb.Publish(context.Background(), fmt.Sprintf("netifly:user:%s", userID), envelo
 | `maxBufferedBytes` | `number` | — | Max bytes allowed in a connection's outbound send buffer (`ws.bufferedAmount`) before it's treated as stalled and shed (see [Limits](#limits)). Defaults to `1_048_576` (1 MB). |
 | `maxConnectionsPerUser` | `number` | — | Max concurrent WebSocket connections for one `userId`, **on this instance** (see [Limits](#limits)). Defaults to `10`. |
 | `namespace` | `string` | — | Scopes Redis channel names to `netifly:<namespace>:user:<id>` instead of the default `netifly:user:<id>` — use this when multiple apps/environments share one Redis instance (see [Redis Configuration](#-redis-configuration)). Defaults to unset (no namespace). |
+| `validate` | `(type: K, data: Events[K]) => void` | — | Optional runtime validation hook (see [Typed events](#typed-events)) — e.g. a Zod/Valibot schema lookup. Called with the resolved `(type, data)` pair before every `send()`/`sendOr()` publishes. Throwing aborts the send and propagates out of the call. Defaults to unset (no validation). |
 
-Returns a `NetiflyInstance`:
+Returns a `NetiflyInstance<Events>`:
 
-- `send<T>(userId, payload: T): Promise<SendResult>` — wraps `payload` as `{ v, id, type: "message", data: payload, ts }` (see [Message Envelope](#message-envelope)) and delivers it to every connection that user has open, anywhere in your cluster. No-op if the user isn't connected anywhere.
-- `send<T>(userId, type: string, data: T): Promise<SendResult>` — same delivery semantics, but wraps as `{ v, id, type, data, ts }` with the `type` you provide instead of the `"message"` default.
+- `send<T>(userId, payload: T): Promise<SendResult>` — wraps `payload` as `{ v, id, type: "message", data: payload, ts }` (see [Message Envelope](#message-envelope)) and delivers it to every connection that user has open, anywhere in your cluster. No-op if the user isn't connected anywhere. Untyped — this overload is unaffected by `Events`.
+- `send<K extends keyof Events & string>(userId, type: K, data: Events[K]): Promise<SendResult>` — same delivery semantics, but wraps as `{ v, id, type, data, ts }` with the `type` you provide instead of the `"message"` default. Type-checked against `Events` when a concrete `Events` map was passed to `createNetifly<Events>()`; otherwise `K` is `string` and `data` is `unknown`, i.e. unchanged from before.
   - `SendResult` is `{ delivered: boolean; instances: number }`. `instances` is the number of server instances that held a live connection for `userId` at publish time — this comes straight from Redis's own `PUBLISH` return value (the subscriber count), so Netifly can tell you **at publish time** whether the user was reachable, something channel-based systems like Pusher/Ably can't do. `delivered` is just `instances > 0`.
   - ⚠️ **Caveat**: `delivered: true` means the message reached a server process holding a live socket for that user — it does **not** mean the user's client actually received or rendered it. Delivery acknowledgements / read-receipts are out of scope for this API and may land as a future addition.
-- `sendOr<T>(userId, payload: T, options: { offline: () => void | Promise<void> }): Promise<SendResult>` / `sendOr<T>(userId, type: string, data: T, options): Promise<SendResult>` — sugar over `send()`: calls `send()` with the same arguments, and if the result is `{ delivered: false }`, calls `options.offline()` and awaits it (if it returns a promise) before resolving. Always resolves with the same `SendResult` `send()` would have. A rejection from `offline()` propagates out of `sendOr()` — it's not swallowed.
+- `sendOr<T>(userId, payload: T, options: { offline: () => void | Promise<void> }): Promise<SendResult>` / `sendOr<K extends keyof Events & string>(userId, type: K, data: Events[K], options): Promise<SendResult>` — sugar over `send()`: calls `send()` with the same arguments, and if the result is `{ delivered: false }`, calls `options.offline()` and awaits it (if it returns a promise) before resolving. Always resolves with the same `SendResult` `send()` would have. A rejection from `offline()` propagates out of `sendOr()` — it's not swallowed.
 - `disconnect(userId): void` — **known limitation: this only closes connections on the local instance.** In a multi-instance deployment, a user may still be connected on other instances after calling this. It is not a cluster-wide "force logout." Workarounds: call `disconnect(userId)` on every instance (e.g. via a pub/sub broadcast of your own), or prefer short-lived auth tokens that `resolveUserId` rejects once revoked, so stale connections are cut off the next time they'd need to reconnect/re-authenticate.
 - `on('connect' | 'disconnect', (userId) => void)`, `on('error', (error) => void)`, `on('reject', ({ reason, status, ... }) => void)`, `on('dropped', ({ userId, reason }) => void)` — **Attaching an `'error'` listener is effectively required for production use** — Netifly never throws into the host process (an unhandled `'error'` emit with no listener would crash it), so without a listener attached, Redis/connection failures are completely invisible.
   - `reject` fires when an upgrade is rejected before a connection is established. `reason: 'origin'` is the Origin/CSWSH check (`{ status: 403, origin, req }`); `reason: 'maxConnectionsPerUser'` fires when a `userId` is already at `maxConnectionsPerUser` **on this instance** (`{ status: 429, userId, req }`) — it does not mean the user is at the cap cluster-wide (see [Limits](#limits)); `reason: 'auth'` fires when `resolveUserId` rejects the connection — returns a falsy value, or throws (`{ status: 401, error, req }`, where `error` is the thrown `Error`, or `undefined` if `resolveUserId` simply returned a falsy value without throwing).
@@ -295,18 +338,21 @@ Same `options` as `createNetifly`, minus `server` (optional — pass your own, o
 
 It also mounts a middleware on `app` that sets `req.netifly: NetiflyInstance` on every request `app` handles, so route handlers can call `req.netifly.send(...)` directly instead of importing/threading the returned `netifly` value.
 
-### `createNetiflyPublisher(options)` — `@netiflyjs/core`
+### `createNetiflyPublisher<Events>(options)` — `@netiflyjs/core`
 
 For processes that don't hold any WebSocket connections themselves — workers, cron jobs, serverless functions (see [Sending from workers / other languages](#-sending-from-workers--other-languages)).
+
+Supports the same `<Events>` type parameter and `validate` option as `createNetifly` (see [Typed events](#typed-events)) — a publisher can enforce the exact same typed/validated send contract a server does, since the two are meant to be interchangeable.
 
 | Option | Type | Required | Description |
 | --- | --- | --- | --- |
 | `redisUrl` | `string` | — | Falls back to `process.env.REDIS_URL` if omitted. One of the two **must** be provided — throws at construction time if neither is set, same as `createNetifly`. |
 | `namespace` | `string` | — | Scopes Redis channel names the same way `createNetifly`'s `namespace` does — must match the value used by the `createNetifly()` server(s) this publisher should reach. Defaults to unset (no namespace). |
+| `validate` | `(type: K, data: Events[K]) => void` | — | Same runtime validation hook as `createNetifly`'s `validate` — called with the resolved `(type, data)` pair before every `send()` publishes; throwing aborts the send. Defaults to unset (no validation). |
 
-Returns a `NetiflyPublisher` — a lighter-weight, send-only counterpart to `NetiflyInstance`, backed by a single lazily-connected Redis client (no subscriber connection, no WebSocket server):
+Returns a `NetiflyPublisher<Events>` — a lighter-weight, send-only counterpart to `NetiflyInstance`, backed by a single lazily-connected Redis client (no subscriber connection, no WebSocket server):
 
-- `send<T>(userId, payload: T): Promise<SendResult>` / `send<T>(userId, type: string, data: T): Promise<SendResult>` — identical envelope/delivery semantics to `NetiflyInstance.send()` (see [Message Envelope](#-message-envelope) above for the shape, and `createNetifly`'s `send()` entry above for the `SendResult`/`delivered` caveat).
+- `send<T>(userId, payload: T): Promise<SendResult>` / `send<K extends keyof Events & string>(userId, type: K, data: Events[K]): Promise<SendResult>` — identical envelope/delivery semantics to `NetiflyInstance.send()` (see [Message Envelope](#-message-envelope) above for the shape, and `createNetifly`'s `send()` entry above for the `SendResult`/`delivered` caveat, and [Typed events](#typed-events) for the `Events`-checked overload).
 - `isOnline(userId): Promise<boolean>` / `whoIsOnline(userIds): Promise<Record<string, boolean>>` — identical semantics/caveats to `NetiflyInstance`'s.
 - `close(): Promise<void>` — disconnects the publisher's Redis connection. Call it before a short-lived process (e.g. a serverless invocation) exits. Calling `send()`/`isOnline()`/`whoIsOnline()` after `close()` throws `Netifly: cannot use publisher after close()`.
 

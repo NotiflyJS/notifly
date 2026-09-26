@@ -2,6 +2,22 @@ import type { IncomingMessage, Server as HttpServer } from 'node:http';
 
 export type UserId = string;
 
+/**
+ * Constrains an application's event-name → payload map, e.g.:
+ *
+ * ```ts
+ * type Events = { 'comment.created': { commentId: string }; 'export.ready': { url: string } };
+ * const netifly = createNetifly<Events>({ ... });
+ * netifly.send(userId, 'export.ready', { url }); // type-checked
+ * ```
+ *
+ * Exported as a plain, unopinionated alias (rather than something
+ * core-specific) so a future `@netiflyjs/client`/`@netiflyjs/react` package
+ * can import and share the exact same `Events` type for typed handlers on
+ * the receiving end, without depending on anything else from this package.
+ */
+export type EventMap = Record<string, unknown>;
+
 export const ENVELOPE_VERSION = 1;
 
 export interface Envelope<T = unknown> {
@@ -29,7 +45,7 @@ export type AllowedOrigins =
   | ((origin: string | undefined) => boolean)
   | '*';
 
-export interface CreateNetiflyOptions {
+export interface CreateNetiflyOptions<Events extends EventMap = EventMap> {
   server: HttpServer;
   resolveUserId: ResolveUserId;
   redisUrl?: string;
@@ -64,6 +80,15 @@ export interface CreateNetiflyOptions {
    * notifications. Defaults to unset (no namespace).
    */
   namespace?: string;
+  /**
+   * Optional runtime validation hook, called with the resolved `(type, data)`
+   * pair for every `send()`/`sendOr()` call, before the envelope is built or
+   * published — a place to plug in Zod, Valibot, or any other schema
+   * validator. Throwing from `validate` aborts the send: nothing is
+   * published, and the error propagates straight out of the `send()`/
+   * `sendOr()` call (it is not caught or wrapped).
+   */
+  validate?: <K extends keyof Events & string>(type: K, data: Events[K]) => void;
 }
 
 /** Emitted via the `reject` event when an upgrade is rejected. */
@@ -113,16 +138,21 @@ export interface SendOrOptions {
   offline: () => void | Promise<void>;
 }
 
-export interface NetiflyInstance {
+export interface NetiflyInstance<Events extends EventMap = EventMap> {
   send<T>(userId: UserId, payload: T): Promise<SendResult>;
-  send<T>(userId: UserId, type: string, data: T): Promise<SendResult>;
+  send<K extends keyof Events & string>(userId: UserId, type: K, data: Events[K]): Promise<SendResult>;
   /**
    * Like `send()`, but calls (and awaits) `options.offline()` when the
    * message wasn't delivered to any connection anywhere in the cluster.
    * Resolves with the same `SendResult` either way.
    */
   sendOr<T>(userId: UserId, payload: T, options: SendOrOptions): Promise<SendResult>;
-  sendOr<T>(userId: UserId, type: string, data: T, options: SendOrOptions): Promise<SendResult>;
+  sendOr<K extends keyof Events & string>(
+    userId: UserId,
+    type: K,
+    data: Events[K],
+    options: SendOrOptions
+  ): Promise<SendResult>;
   disconnect(userId: UserId): void;
   on(event: 'connect' | 'disconnect', listener: (userId: UserId) => void): this;
   on(event: 'error', listener: (error: Error) => void): this;
@@ -156,7 +186,7 @@ export interface NetiflyInstance {
   isConnectedHere(userId: UserId): boolean;
 }
 
-export interface CreateNetiflyPublisherOptions {
+export interface CreateNetiflyPublisherOptions<Events extends EventMap = EventMap> {
   redisUrl?: string;
   /**
    * Scopes Redis channel names to `netifly:<namespace>:user:<id>` instead of
@@ -165,6 +195,14 @@ export interface CreateNetiflyPublisherOptions {
    * unset (no namespace).
    */
   namespace?: string;
+  /**
+   * Same runtime validation hook as `CreateNetiflyOptions.validate` — a
+   * publisher can enforce the same contract a server does, since the two are
+   * meant to be interchangeable (see `NetiflyPublisher`). Called with the
+   * resolved `(type, data)` pair before publishing; a throw aborts the send
+   * and propagates straight out of `send()`.
+   */
+  validate?: <K extends keyof Events & string>(type: K, data: Events[K]) => void;
 }
 
 /**
@@ -178,9 +216,9 @@ export interface CreateNetiflyPublisherOptions {
  * with `close()` when the process is about to exit (e.g. at the end of a
  * serverless invocation).
  */
-export interface NetiflyPublisher {
+export interface NetiflyPublisher<Events extends EventMap = EventMap> {
   send<T>(userId: UserId, payload: T): Promise<SendResult>;
-  send<T>(userId: UserId, type: string, data: T): Promise<SendResult>;
+  send<K extends keyof Events & string>(userId: UserId, type: K, data: Events[K]): Promise<SendResult>;
   /**
    * Whether `userId` has a live connection anywhere in the cluster. Same
    * semantics/accuracy caveat as `NetiflyInstance.isOnline`.

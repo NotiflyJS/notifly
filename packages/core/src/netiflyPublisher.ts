@@ -5,19 +5,22 @@ import { ENVELOPE_VERSION } from './types';
 import type {
   CreateNetiflyPublisherOptions,
   Envelope,
+  EventMap,
   NetiflyPublisher,
   SendResult,
   UserId,
 } from './types';
 
-class NetiflyPublisherImpl implements NetiflyPublisher {
+class NetiflyPublisherImpl<Events extends EventMap = EventMap> implements NetiflyPublisher<Events> {
   private readonly redis: Redis;
   private readonly namespace: string | undefined;
+  private readonly validate: CreateNetiflyPublisherOptions<Events>['validate'];
   private readonly ulid = monotonicFactory();
   private closed = false;
 
-  constructor(options: CreateNetiflyPublisherOptions) {
+  constructor(options: CreateNetiflyPublisherOptions<Events>) {
     this.namespace = options.namespace;
+    this.validate = options.validate;
 
     const redisUrl = options.redisUrl ?? process.env.REDIS_URL;
     if (!redisUrl) {
@@ -48,12 +51,20 @@ class NetiflyPublisherImpl implements NetiflyPublisher {
   }
 
   async send<T>(userId: UserId, payload: T): Promise<SendResult>;
-  async send<T>(userId: UserId, type: string, data: T): Promise<SendResult>;
+  async send<K extends keyof Events & string>(
+    userId: UserId,
+    type: K,
+    data: Events[K]
+  ): Promise<SendResult>;
   async send<T>(userId: UserId, ...rest: [T] | [string, T]): Promise<SendResult> {
     this.assertNotClosed();
 
-    const envelope =
-      rest.length === 2 ? this.buildEnvelope(rest[0], rest[1]) : this.buildEnvelope('message', rest[0]);
+    const type = rest.length === 2 ? rest[0] : 'message';
+    const data = rest.length === 2 ? rest[1] : rest[0];
+    // See the matching comment in netiflyServer.ts's sendInternal for why
+    // this cast is needed at the call site.
+    (this.validate as ((type: string, data: unknown) => void) | undefined)?.(type, data);
+    const envelope = this.buildEnvelope(type, data);
 
     let serialized: string;
     try {
@@ -103,6 +114,8 @@ class NetiflyPublisherImpl implements NetiflyPublisher {
   }
 }
 
-export function createNetiflyPublisher(options: CreateNetiflyPublisherOptions): NetiflyPublisher {
-  return new NetiflyPublisherImpl(options);
+export function createNetiflyPublisher<Events extends EventMap = EventMap>(
+  options: CreateNetiflyPublisherOptions<Events>
+): NetiflyPublisher<Events> {
+  return new NetiflyPublisherImpl<Events>(options);
 }

@@ -810,4 +810,82 @@ describe('createNetifly', () => {
       addSpy.mockRestore();
     }
   });
+
+  // NOT-16: `validate` is a runtime hook (e.g. for a Zod/Valibot schema) that
+  // should see the exact same (type, data) pair that ends up in the
+  // envelope, run before anything is published, and be able to veto a send
+  // outright by throwing.
+  it('calls validate with the resolved (type, data) before publishing (NOT-16)', async () => {
+    const validate = jest.fn();
+    const server = await startTestServer(() => 'netiflyServer-validate-called', { validate });
+    servers.push(server);
+
+    const connectedPromise = onceEvent(server.netifly, 'connect');
+    const client = await connectClient(server.port);
+    clients.push(client);
+    await connectedPromise;
+
+    const messagePromise = nextMessage(client);
+    await server.netifly.send('netiflyServer-validate-called', 'comment.created', {
+      commentId: '42',
+    });
+    await messagePromise;
+
+    expect(validate).toHaveBeenCalledTimes(1);
+    expect(validate).toHaveBeenCalledWith('comment.created', { commentId: '42' });
+  });
+
+  it('a validate that throws prevents delivery and propagates out of send() (NOT-16)', async () => {
+    const thrown = new Error('netiflyServer-validate-thrown');
+    const validate = jest.fn(() => {
+      throw thrown;
+    });
+    const server = await startTestServer(() => 'netiflyServer-validate-throws', { validate });
+    servers.push(server);
+
+    const connectedPromise = onceEvent(server.netifly, 'connect');
+    const client = await connectClient(server.port);
+    clients.push(client);
+    await connectedPromise;
+
+    let receivedMessage = false;
+    client.once('message', () => {
+      receivedMessage = true;
+    });
+
+    await expect(
+      server.netifly.send('netiflyServer-validate-throws', 'comment.created', { commentId: '1' })
+    ).rejects.toBe(thrown);
+
+    await wait(50);
+    expect(receivedMessage).toBe(false);
+  });
+
+  it('send()/sendOr() behave exactly as before when no validate is configured (NOT-16)', async () => {
+    const server = await startTestServer(() => 'netiflyServer-no-validate');
+    servers.push(server);
+
+    const connectedPromise = onceEvent(server.netifly, 'connect');
+    const client = await connectClient(server.port);
+    clients.push(client);
+    await connectedPromise;
+
+    const messagePromise = nextMessage(client);
+    const result = await server.netifly.send('netiflyServer-no-validate', 'comment.created', {
+      commentId: '1',
+    });
+    const envelope = JSON.parse(await messagePromise);
+
+    expect(result).toEqual({ delivered: true, instances: 1 });
+    expect(envelope).toMatchObject({ type: 'comment.created', data: { commentId: '1' } });
+
+    const offline = jest.fn();
+    const sendOrResult = await server.netifly.sendOr(
+      'netiflyServer-no-validate-nobody-home',
+      { type: 'x' },
+      { offline }
+    );
+    expect(sendOrResult).toEqual({ delivered: false, instances: 0 });
+    expect(offline).toHaveBeenCalledTimes(1);
+  });
 });

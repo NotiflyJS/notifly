@@ -7,6 +7,7 @@ export type {
   CreateNetiflyPublisherOptions,
   DroppedInfo,
   Envelope,
+  EventMap,
   NetiflyInstance,
   NetiflyPublisher,
   RejectInfo,
