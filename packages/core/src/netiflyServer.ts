@@ -11,6 +11,7 @@ import type {
   AllowedOrigins,
   CreateNetiflyOptions,
   Envelope,
+  EventMap,
   NetiflyInstance,
   RejectInfo,
   SendOrOptions,
@@ -24,21 +25,25 @@ const DEFAULT_MAX_PAYLOAD = 4096;
 const DEFAULT_MAX_BUFFERED_BYTES = 1_048_576;
 const DEFAULT_MAX_CONNECTIONS_PER_USER = 10;
 
-class NetiflyServerImpl extends EventEmitter implements NetiflyInstance {
+class NetiflyServerImpl<Events extends EventMap = EventMap>
+  extends EventEmitter
+  implements NetiflyInstance<Events>
+{
   private readonly wss: WebSocketServer;
   private readonly registry: ConnectionRegistry<WebSocket>;
   private readonly router: RedisRouter;
-  private readonly resolveUserId: CreateNetiflyOptions['resolveUserId'];
+  private readonly resolveUserId: CreateNetiflyOptions<Events>['resolveUserId'];
   private readonly path: string;
   private readonly allowedOrigins: AllowedOrigins | undefined;
   private readonly maxPayload: number;
   private readonly maxBufferedBytes: number;
   private readonly maxConnectionsPerUser: number;
+  private readonly validate: CreateNetiflyOptions<Events>['validate'];
   private readonly heartbeatTimer: NodeJS.Timeout;
   private readonly ulid = monotonicFactory();
   private closed = false;
 
-  constructor(options: CreateNetiflyOptions) {
+  constructor(options: CreateNetiflyOptions<Events>) {
     super();
     this.resolveUserId = options.resolveUserId;
     this.path = options.path ?? DEFAULT_PATH;
@@ -46,6 +51,7 @@ class NetiflyServerImpl extends EventEmitter implements NetiflyInstance {
     this.maxPayload = options.maxPayload ?? DEFAULT_MAX_PAYLOAD;
     this.maxBufferedBytes = options.maxBufferedBytes ?? DEFAULT_MAX_BUFFERED_BYTES;
     this.maxConnectionsPerUser = options.maxConnectionsPerUser ?? DEFAULT_MAX_CONNECTIONS_PER_USER;
+    this.validate = options.validate;
 
     this.registry = new ConnectionRegistry<WebSocket>({});
 
@@ -248,16 +254,20 @@ class NetiflyServerImpl extends EventEmitter implements NetiflyInstance {
   }
 
   async send<T>(userId: UserId, payload: T): Promise<SendResult>;
-  async send<T>(userId: UserId, type: string, data: T): Promise<SendResult>;
+  async send<K extends keyof Events & string>(
+    userId: UserId,
+    type: K,
+    data: Events[K]
+  ): Promise<SendResult>;
   async send<T>(userId: UserId, ...rest: [T] | [string, T]): Promise<SendResult> {
     return this.sendInternal(userId, rest);
   }
 
   async sendOr<T>(userId: UserId, payload: T, options: SendOrOptions): Promise<SendResult>;
-  async sendOr<T>(
+  async sendOr<K extends keyof Events & string>(
     userId: UserId,
-    type: string,
-    data: T,
+    type: K,
+    data: Events[K],
     options: SendOrOptions
   ): Promise<SendResult>;
   async sendOr<T>(
@@ -278,8 +288,18 @@ class NetiflyServerImpl extends EventEmitter implements NetiflyInstance {
     if (this.closed) {
       throw new Error('Netifly: cannot send after close()');
     }
-    const envelope =
-      rest.length === 2 ? this.buildEnvelope(rest[0], rest[1]) : this.buildEnvelope('message', rest[0]);
+    const type = rest.length === 2 ? rest[0] : 'message';
+    const data = rest.length === 2 ? rest[1] : rest[0];
+    // Cast needed at the call site: `validate`'s declared type ties `K` to
+    // `Events` for type-checking at the *options* call site (see types.ts),
+    // but here `type` is just a resolved `string` and `Events` is this
+    // class's own unresolved generic parameter, so TS can't verify the pair
+    // matches a specific `K` — the check already happened when the caller
+    // built `options.validate` (or, for typed `send()` calls, when the
+    // caller invoked `send()` itself). At runtime this is exactly the actual
+    // `(type, data)` pair being sent.
+    (this.validate as ((type: string, data: unknown) => void) | undefined)?.(type, data);
+    const envelope = this.buildEnvelope(type, data);
     const instances = await this.router.publish(userId, envelope);
     return { delivered: instances > 0, instances };
   }
@@ -334,6 +354,8 @@ class NetiflyServerImpl extends EventEmitter implements NetiflyInstance {
   }
 }
 
-export function createNetifly(options: CreateNetiflyOptions): NetiflyInstance {
-  return new NetiflyServerImpl(options);
+export function createNetifly<Events extends EventMap = EventMap>(
+  options: CreateNetiflyOptions<Events>
+): NetiflyInstance<Events> {
+  return new NetiflyServerImpl<Events>(options);
 }
