@@ -118,6 +118,19 @@ export interface DroppedInfo {
   reason: 'maxBufferedBytes';
 }
 
+export interface CloseOptions {
+  /**
+   * Milliseconds to wait for clients to acknowledge a graceful close (code
+   * 1012) before terminating stragglers. Defaults to 5000.
+   */
+  drainMs?: number;
+  /**
+   * Skip the graceful drain and terminate every connection immediately —
+   * the previous close() behavior. Defaults to false.
+   */
+  force?: boolean;
+}
+
 /**
  * Result of a `send()`/`sendOr()` call. `instances` is the number of server
  * instances that held a live connection for the user at publish time (Redis
@@ -162,7 +175,7 @@ export interface NetiflyInstance<Events extends EventMap = EventMap> {
   once(event: 'error', listener: (error: Error) => void): this;
   once(event: 'reject', listener: (info: RejectInfo) => void): this;
   once(event: 'dropped', listener: (info: DroppedInfo) => void): this;
-  close(): Promise<void>;
+  close(options?: CloseOptions): Promise<void>;
   /**
    * Whether `userId` has a live connection anywhere in the cluster, derived
    * from Redis `PUBSUB NUMSUB` on that user's channel. Accurate only within

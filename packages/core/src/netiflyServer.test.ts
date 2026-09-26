@@ -530,6 +530,123 @@ describe('createNetifly', () => {
     servers.pop(); // already closed above; skip afterEach double-close
   });
 
+  // NOT-19: close() should send a real close frame with code 1012 ("Service
+  // Restart") instead of terminate()-ing every socket, so clients can tell a
+  // graceful shutdown apart from an abrupt drop and reconnect accordingly.
+  it('close() sends close code 1012 to a connected client by default (NOT-19)', async () => {
+    const server = await startTestServer(() => 'netiflyServer-close-1012');
+    servers.push(server);
+
+    const connectedPromise = onceEvent(server.netifly, 'connect');
+    const client = await connectClient(server.port);
+    clients.push(client);
+    await connectedPromise;
+
+    const clientClosePromise = new Promise<number>((resolve) => {
+      client.once('close', (code) => resolve(code));
+    });
+
+    await server.netifly.close();
+    servers.pop(); // already closed above; skip afterEach double-close
+
+    expect(await clientClosePromise).toBe(1012);
+  });
+
+  // NOT-19: a client that never completes the closing handshake (e.g. dead
+  // network, unresponsive process) must not block close() forever — after
+  // drainMs elapses, any still-connected socket is force-terminated so
+  // close() resolves on a bounded timeline.
+  it('close() resolves within drainMs even when a client never acknowledges the close frame (NOT-19)', async () => {
+    const server = await startTestServer(() => 'netiflyServer-close-straggler');
+    servers.push(server);
+
+    const registered: WebSocket[] = [];
+    const originalAdd = ConnectionRegistry.prototype.add;
+    const addSpy = jest
+      .spyOn(ConnectionRegistry.prototype, 'add')
+      .mockImplementation(function (this: ConnectionRegistry<unknown>, uid: string, connection: unknown) {
+        registered.push(connection as WebSocket);
+        return originalAdd.call(this, uid, connection);
+      });
+
+    try {
+      const firstConnected = onceEvent(server.netifly, 'connect');
+      const stragglerClient = await connectClient(server.port);
+      clients.push(stragglerClient);
+      await firstConnected;
+
+      const secondConnected = onceEvent(server.netifly, 'connect');
+      const normalClient = await connectClient(server.port);
+      clients.push(normalClient);
+      await secondConnected;
+
+      expect(registered).toHaveLength(2);
+      // Make the server-side socket for the straggler unresponsive to a
+      // graceful close: stubbing its own close() to a no-op means it never
+      // emits a 'close' event on its own, simulating a client that received
+      // the close frame but never completed the handshake (dead network,
+      // hung process, etc).
+      registered[0].close = () => {
+        /* deliberately unresponsive to graceful close, for this test only */
+      };
+
+      const started = Date.now();
+      await Promise.race([
+        server.netifly.close({ drainMs: 75 }),
+        wait(3000).then(() => {
+          throw new Error('close() did not resolve within 3000ms despite an unresponsive client');
+        }),
+      ]);
+      const elapsed = Date.now() - started;
+      servers.pop(); // already closed above; skip afterEach double-close
+
+      // Should take roughly drainMs (bounded below by it, well under the 3s
+      // safety net above) rather than resolving immediately or hanging.
+      expect(elapsed).toBeGreaterThanOrEqual(70);
+      expect(elapsed).toBeLessThan(2000);
+    } finally {
+      addSpy.mockRestore();
+    }
+  });
+
+  // NOT-19: force: true preserves the pre-NOT-19 behavior exactly — every
+  // connection is terminate()'d immediately, no graceful drain at all.
+  it('close({ force: true }) terminates connections immediately regardless of drainMs (NOT-19)', async () => {
+    const server = await startTestServer(() => 'netiflyServer-close-force');
+    servers.push(server);
+
+    const connectedPromise = onceEvent(server.netifly, 'connect');
+    const client = await connectClient(server.port);
+    clients.push(client);
+    await connectedPromise;
+
+    const clientClosePromise = new Promise<{ code: number; hadError: boolean }>((resolve) => {
+      let hadError = false;
+      client.once('error', () => {
+        hadError = true;
+      });
+      client.once('close', (code) => resolve({ code, hadError }));
+    });
+
+    const started = Date.now();
+    await Promise.race([
+      server.netifly.close({ force: true, drainMs: 60_000 }),
+      wait(2000).then(() => {
+        throw new Error('close({ force: true }) did not resolve promptly');
+      }),
+    ]);
+    const elapsed = Date.now() - started;
+    servers.pop(); // already closed above; skip afterEach double-close
+
+    // Resolves quickly, without waiting anywhere near the (very large) drainMs.
+    expect(elapsed).toBeLessThan(2000);
+
+    // terminate() doesn't perform a clean closing handshake, so the client
+    // sees an abnormal closure rather than code 1012.
+    const { code } = await clientClosePromise;
+    expect(code).not.toBe(1012);
+  });
+
   it('rejects send() after close()', async () => {
     const server = await startTestServer(() => 'netiflyServer-gina');
     servers.push(server);

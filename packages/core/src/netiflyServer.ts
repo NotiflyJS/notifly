@@ -9,6 +9,7 @@ import { startHeartbeat } from './heartbeat';
 import { ENVELOPE_VERSION } from './types';
 import type {
   AllowedOrigins,
+  CloseOptions,
   CreateNetiflyOptions,
   Envelope,
   EventMap,
@@ -24,6 +25,7 @@ const HEARTBEAT_INTERVAL_MS = 30_000;
 const DEFAULT_MAX_PAYLOAD = 4096;
 const DEFAULT_MAX_BUFFERED_BYTES = 1_048_576;
 const DEFAULT_MAX_CONNECTIONS_PER_USER = 10;
+const DEFAULT_DRAIN_MS = 5000;
 
 class NetiflyServerImpl<Events extends EventMap = EventMap>
   extends EventEmitter
@@ -331,19 +333,53 @@ class NetiflyServerImpl<Events extends EventMap = EventMap>
     }
   }
 
-  async close(): Promise<void> {
+  async close(options: CloseOptions = {}): Promise<void> {
     if (this.closed) {
       return;
     }
     this.closed = true;
     clearInterval(this.heartbeatTimer);
 
+    const { drainMs = DEFAULT_DRAIN_MS, force = false } = options;
+
     // WebSocketServer#close's callback only fires once wss.clients is empty
     // — it does not close tracked client sockets itself. With any client
     // still connected, awaiting it below would hang forever, so every
-    // tracked client is force-closed first.
-    for (const ws of this.wss.clients) {
-      ws.terminate();
+    // tracked client needs to be gone first.
+    //
+    // By default that's done gracefully: every currently-OPEN client is sent
+    // a real close frame with code 1012 ("Service Restart") so it can tell a
+    // deploy apart from an abrupt drop and reconnect accordingly, rather than
+    // every connection dropping and reconnecting at the same instant. We wait
+    // for each socket's own 'close' event (proving it completed its closing
+    // handshake) or `drainMs`, whichever comes first, then unconditionally
+    // terminate() whatever is still left in wss.clients — stragglers that
+    // never acknowledged the close frame — so this can never hang. Passing
+    // `force: true` skips the drain entirely and terminate()s everyone
+    // immediately, matching the pre-NOT-19 behavior (useful for tests, or an
+    // already-degraded process that can't afford to wait).
+    if (force || this.wss.clients.size === 0) {
+      for (const ws of this.wss.clients) {
+        ws.terminate();
+      }
+    } else {
+      const drained = Promise.all(
+        Array.from(this.wss.clients)
+          .filter((ws) => ws.readyState === WebSocket.OPEN)
+          .map(
+            (ws) =>
+              new Promise<void>((resolve) => {
+                ws.once('close', () => resolve());
+                ws.close(1012, 'Netifly: server is restarting');
+              })
+          )
+      );
+      const timeout = new Promise<void>((resolve) => setTimeout(resolve, drainMs));
+      await Promise.race([drained, timeout]);
+
+      for (const ws of this.wss.clients) {
+        ws.terminate();
+      }
     }
 
     await new Promise<void>((resolve, reject) => {
