@@ -125,6 +125,14 @@ describe('createNetifly', () => {
     servers.push(server);
 
     await expect(connectClient(server.port)).rejects.toBeDefined();
+
+    const rejectPromise = new Promise<RejectInfo>((resolve) =>
+      server.netifly.once('reject', (info) => resolve(info))
+    );
+    const { statusCode } = await connectExpectingRejection(server.port);
+    expect(statusCode).toBe(401);
+    const info = await rejectPromise;
+    expect(info).toMatchObject({ reason: 'auth', status: 401, error: undefined });
   });
 
   it('rejects the upgrade when resolveUserId returns a non-string value', async () => {
@@ -132,6 +140,35 @@ describe('createNetifly', () => {
     servers.push(server);
 
     await expect(connectClient(server.port)).rejects.toBeDefined();
+
+    const rejectPromise = new Promise<RejectInfo>((resolve) =>
+      server.netifly.once('reject', (info) => resolve(info))
+    );
+    const { statusCode } = await connectExpectingRejection(server.port);
+    expect(statusCode).toBe(401);
+    const info = await rejectPromise;
+    expect(info).toMatchObject({ reason: 'auth', status: 401, error: undefined });
+  });
+
+  it("emits a 'reject' event with the thrown error when resolveUserId throws (NOT-17)", async () => {
+    const thrown = new Error('netiflyServer-auth-thrown');
+    const server = await startTestServer(() => {
+      throw thrown;
+    });
+    servers.push(server);
+
+    const rejectPromise = new Promise<RejectInfo>((resolve) =>
+      server.netifly.once('reject', (info) => resolve(info))
+    );
+
+    const { statusCode } = await connectExpectingRejection(server.port);
+
+    expect(statusCode).toBe(401);
+    const info = await rejectPromise;
+    expect(info).toMatchObject({ reason: 'auth', status: 401 });
+    expect((info as { error?: unknown }).error).toBeInstanceOf(Error);
+    expect(((info as { error?: Error }).error as Error).message).toBe('netiflyServer-auth-thrown');
+    expect((info as { error?: Error }).error).toBe(thrown);
   });
 
   it('rejects a cross-origin upgrade with HTTP 403 by default (NOT-6)', async () => {

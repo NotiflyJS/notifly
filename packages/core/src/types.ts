@@ -79,6 +79,12 @@ export type RejectInfo =
       status: number;
       userId: UserId;
       req: IncomingMessage;
+    }
+  | {
+      reason: 'auth';
+      status: 401;
+      error: Error | undefined;
+      req: IncomingMessage;
     };
 
 /** Emitted via the `dropped` event when a queued delivery is skipped for a connection. */

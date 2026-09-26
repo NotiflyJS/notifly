@@ -91,15 +91,18 @@ class NetiflyServerImpl extends EventEmitter implements NetiflyInstance {
     }
 
     let userId: unknown;
+    let authError: Error | undefined;
     try {
       userId = await this.resolveUserId(req);
     } catch (error) {
-      this.emitError(error);
+      authError = error instanceof Error ? error : new Error(String(error));
       userId = null;
     }
 
     if (typeof userId !== 'string' || userId.length === 0) {
-      socket.destroy();
+      socket.once('finish', () => socket.destroy());
+      socket.end('HTTP/1.1 401 Unauthorized\r\nConnection: close\r\n\r\n');
+      this.emitReject({ reason: 'auth', status: 401, error: authError, req });
       return;
     }
 
