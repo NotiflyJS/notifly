@@ -1,6 +1,6 @@
 {
   "name": "@netiflyjs/core",
-  "version": "1.9.0",
+  "version": "1.10.0",
   "description": "Framework-agnostic real-time notification core for Node.js servers, backed by WebSockets and Redis.",
   "license": "MIT",
   "repository": {

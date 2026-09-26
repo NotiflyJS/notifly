@@ -1,3 +1,10 @@
+# [@netiflyjs/core-v1.10.0](https://github.com/NetiflyJS/netifly/compare/@netiflyjs/core-v1.9.0...@netiflyjs/core-v1.10.0) (2026-09-26)
+
+
+### Features
+
+* **core:** graceful close() draining connections with code 1012 ([d9599ab](https://github.com/NetiflyJS/netifly/commit/d9599aba662f9511fdbbe9ca243e9a906c932d22))
+
 # [@netiflyjs/core-v1.9.0](https://github.com/NetiflyJS/netifly/compare/@netiflyjs/core-v1.8.0...@netiflyjs/core-v1.9.0) (2026-09-26)
 
 
