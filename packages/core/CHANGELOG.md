@@ -1,3 +1,11 @@
+# [@netiflyjs/core-v1.8.0](https://github.com/NetiflyJS/netifly/compare/@netiflyjs/core-v1.7.0...@netiflyjs/core-v1.8.0) (2026-09-26)
+
+
+### Features
+
+* **core:** add createNetiflyPublisher() for workers/cron/serverless ([46c3a0a](https://github.com/NetiflyJS/netifly/commit/46c3a0a37bf1231e0aee9c23556b5e9d4270cf14))
+* **core:** reject unauthorized upgrades with 401 + reject event ([6f3976c](https://github.com/NetiflyJS/netifly/commit/6f3976c7ad23bcf9488a2cc80f4258826b7b3c7c))
+
 # [@netiflyjs/core-v1.7.0](https://github.com/NetiflyJS/netifly/compare/@netiflyjs/core-v1.6.0...@netiflyjs/core-v1.7.0) (2026-09-26)
 
 
