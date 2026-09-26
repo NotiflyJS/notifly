@@ -1,3 +1,10 @@
+# [@netiflyjs/core-v1.9.0](https://github.com/NetiflyJS/netifly/compare/@netiflyjs/core-v1.8.0...@netiflyjs/core-v1.9.0) (2026-09-26)
+
+
+### Features
+
+* **core:** add typed events via createNetifly<Events>() and a validate hook ([3a28676](https://github.com/NetiflyJS/netifly/commit/3a286764de68e3ea4abcc43302750bd8cf3d2b9a))
+
 # [@netiflyjs/core-v1.8.0](https://github.com/NetiflyJS/netifly/compare/@netiflyjs/core-v1.7.0...@netiflyjs/core-v1.8.0) (2026-09-26)
 
 
