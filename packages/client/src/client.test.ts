@@ -401,7 +401,9 @@ describe('NetiflyClient', () => {
 
       const client = makeClient(port, { baseDelayMs: 25, maxDelayMs: 100 });
       const states: ConnectionState[] = [];
+      const codes: number[] = [];
       client.onStateChange((state) => states.push(state));
+      client.onClose((event) => codes.push(event.code));
 
       client.connect();
       await nextState(client, 'reconnecting');
@@ -410,6 +412,14 @@ describe('NetiflyClient', () => {
       // A never-opened failure is indistinguishable from an auth rejection,
       // so the client keeps retrying rather than giving up.
       expect(states.filter((s) => s === 'connecting').length).toBeGreaterThan(1);
+      // Regression guard for a real runtime difference: Node 22's undici 6
+      // fires only 'error' (never 'close') on a refused connection, where
+      // browsers and Node 24+ also fire 'close' with 1006. The client
+      // normalizes both into a single 1006 close, so a failed handshake
+      // always drives a retry — without this it hangs in 'connecting'
+      // forever on Node 22, the minimum version this package supports.
+      expect(codes.length).toBeGreaterThan(1);
+      expect(new Set(codes)).toEqual(new Set([1006]));
 
       const opened = nextState(client, 'open');
       track(await startServer(port));

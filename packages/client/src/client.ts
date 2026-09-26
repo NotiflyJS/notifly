@@ -241,6 +241,28 @@ export class NetiflyClient<Events extends EventMap = EventMap> {
     this.socket = socket;
 
     let opened = false;
+    let settled = false;
+
+    /** Runs exactly once per socket: this connection is over, decide what next. */
+    const settle = (info: CloseInfo): void => {
+      if (settled) return;
+      settled = true;
+      this.socket = undefined;
+      this.negotiatedProtocol = '';
+      this.emitClose(info);
+
+      if (this.intentional) {
+        this.setState('closed');
+        return;
+      }
+
+      const plan = planReconnect(opened, info.code);
+      if (plan === 'none') {
+        this.setState('closed');
+        return;
+      }
+      this.scheduleReconnect(plan);
+    };
 
     socket.addEventListener('open', () => {
       if (generation !== this.generation) return;
@@ -255,30 +277,33 @@ export class NetiflyClient<Events extends EventMap = EventMap> {
       this.handleMessage(event.data);
     });
 
-    // A failed handshake fires 'error' with no useful detail — the spec
-    // deliberately withholds it (see planReconnect) — and is always followed
-    // by 'close', which is where every reconnect decision is made. This
-    // listener exists only so runtimes that complain about unhandled 'error'
-    // events stay quiet.
-    socket.addEventListener('error', () => undefined);
+    socket.addEventListener('error', () => {
+      if (generation !== this.generation) return;
+      // Runtime compatibility, verified by experiment: Node 22's bundled
+      // undici (6.x) fires ONLY 'error' — never 'close' — when a connection
+      // fails *before* the handshake completes (connection refused, DNS
+      // failure). Browsers and Node 24+ (undici 7.x) follow the spec and
+      // also fire 'close' with 1006. Without settling here, a client whose
+      // server is unreachable would sit in 'connecting' forever instead of
+      // retrying, on this package's own minimum Node version.
+      //
+      // 1006 is synthesized to match what a spec-compliant runtime reports
+      // for exactly this case, and nothing is lost by it: a socket that
+      // never opened has no trustworthy code anyway (see planReconnect).
+      //
+      // A socket that HAS opened is left to its own 'close' event, which
+      // every runtime fires (an abrupt mid-connection drop still produces
+      // 1006 on undici 6) and which carries the real close code — that code
+      // is the whole basis of the 1000/1005/1012 policy, so it must not be
+      // pre-empted by an 'error' that carries no detail at all.
+      if (!opened) {
+        settle({ code: 1006, reason: '', wasClean: false });
+      }
+    });
 
     socket.addEventListener('close', (event: CloseEvent) => {
       if (generation !== this.generation) return;
-      this.socket = undefined;
-      this.negotiatedProtocol = '';
-      this.emitClose({ code: event.code, reason: event.reason, wasClean: event.wasClean });
-
-      if (this.intentional) {
-        this.setState('closed');
-        return;
-      }
-
-      const plan = planReconnect(opened, event.code);
-      if (plan === 'none') {
-        this.setState('closed');
-        return;
-      }
-      this.scheduleReconnect(plan);
+      settle({ code: event.code, reason: event.reason, wasClean: event.wasClean });
     });
   }
 
