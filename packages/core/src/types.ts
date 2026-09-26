@@ -155,3 +155,39 @@ export interface NetiflyInstance {
    */
   isConnectedHere(userId: UserId): boolean;
 }
+
+export interface CreateNetiflyPublisherOptions {
+  redisUrl?: string;
+  /**
+   * Scopes Redis channel names to `netifly:<namespace>:user:<id>` instead of
+   * the default `netifly:user:<id>` — must match the `namespace` used by the
+   * `createNetifly()` server(s) this publisher should reach. Defaults to
+   * unset (no namespace).
+   */
+  namespace?: string;
+}
+
+/**
+ * A send-only, presence-aware handle to Netifly's Redis pub/sub layer, for
+ * processes that don't hold any WebSocket connections themselves — BullMQ
+ * workers, cron jobs, Lambda/Vercel functions, and other backend services
+ * that need to notify a user without running a `createNetifly()` server.
+ *
+ * Opens only a Redis publisher connection (no subscriber, no WebSocket
+ * server), so it's cheap to construct in short-lived environments — pair
+ * with `close()` when the process is about to exit (e.g. at the end of a
+ * serverless invocation).
+ */
+export interface NetiflyPublisher {
+  send<T>(userId: UserId, payload: T): Promise<SendResult>;
+  send<T>(userId: UserId, type: string, data: T): Promise<SendResult>;
+  /**
+   * Whether `userId` has a live connection anywhere in the cluster. Same
+   * semantics/accuracy caveat as `NetiflyInstance.isOnline`.
+   */
+  isOnline(userId: UserId): Promise<boolean>;
+  /** Same as `isOnline`, batched. Same semantics as `NetiflyInstance.whoIsOnline`. */
+  whoIsOnline(userIds: UserId[]): Promise<Record<UserId, boolean>>;
+  /** Disconnects the publisher's Redis connection. */
+  close(): Promise<void>;
+}

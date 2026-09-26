@@ -200,6 +200,63 @@ This is a **public wire contract**: every message Netifly delivers over the WebS
 
 Non-Node publishers (e.g. publishing directly to a Netifly Redis channel from another language) should produce messages in this exact shape so clients can parse them consistently.
 
+## 📤 Sending from workers / other languages
+
+Most notifications don't originate in the process handling your HTTP/WebSocket traffic — a BullMQ worker finishes an AI generation, a cron job wraps up a batch export, a Lambda or Vercel function processes a webhook. `createNetifly()` requires an `http.Server`, which none of those have. `createNetiflyPublisher()` does not:
+
+```ts
+import { createNetiflyPublisher } from '@netiflyjs/core';
+
+const publisher = createNetiflyPublisher({ redisUrl: process.env.REDIS_URL });
+
+await publisher.send(userId, 'export.ready', { url });
+await publisher.isOnline(userId);
+
+await publisher.close(); // short-lived processes (e.g. serverless functions) should close when done
+```
+
+It opens only a Redis **publisher** connection — no subscriber, no WebSocket server — and connects lazily (on first use, not at construction), so building one in a handler that might return early, without ever sending anything, costs nothing. A `createNetiflyPublisher()` in one process and a `createNetifly()` server in another are fully interchangeable: they speak the exact same Redis pub/sub wire protocol, so a publisher's `send()` delivers straight to a socket the server is holding, wherever that server happens to be running. See [API Reference](#-api-reference) for the full `NetiflyPublisher` surface.
+
+### Publishing directly, without this library
+
+You don't need `@netiflyjs/core` at all to notify a Netifly user — any language with a Redis client can `PUBLISH` directly, as long as it matches Netifly's wire protocol:
+
+1. **Channel name**: `netifly:user:<id>`, or `netifly:<namespace>:user:<id>` if the `createNetifly()` server(s) you're targeting were configured with a `namespace` (see [Sharing one Redis instance](#sharing-one-redis-instance-across-apps-or-environments)).
+2. **Message body**: a JSON-encoded [envelope](#-message-envelope) — `{ v, id, type, data, ts }`. `v` is currently always `1`; `id` should be a unique string, ideally sortable (a ULID, or your own monotonically increasing id); `ts` is epoch milliseconds.
+
+#### Python (`redis-py`)
+
+```python
+import json, time, uuid, redis
+
+r = redis.Redis.from_url("redis://127.0.0.1:6379")
+
+envelope = {
+    "v": 1,
+    "id": str(uuid.uuid4()),
+    "type": "export.ready",
+    "data": {"url": "https://example.com/export.zip"},
+    "ts": int(time.time() * 1000),
+}
+
+r.publish(f"netifly:user:{user_id}", json.dumps(envelope))
+```
+
+#### Go (`go-redis`)
+
+```go
+envelope, _ := json.Marshal(map[string]any{
+    "v":    1,
+    "id":   uuid.NewString(),
+    "type": "export.ready",
+    "data": map[string]string{"url": "https://example.com/export.zip"},
+    "ts":   time.Now().UnixMilli(),
+})
+
+rdb := redis.NewClient(&redis.Options{Addr: "127.0.0.1:6379"})
+rdb.Publish(context.Background(), fmt.Sprintf("netifly:user:%s", userID), envelope)
+```
+
 ## 📖 API Reference
 
 ### `createNetifly(options)` — `@netiflyjs/core`
@@ -237,6 +294,21 @@ Returns a `NetiflyInstance`:
 Same `options` as `createNetifly`, minus `server` (optional — pass your own, or let it create one from the Express app). Returns `{ server, netifly }`.
 
 It also mounts a middleware on `app` that sets `req.netifly: NetiflyInstance` on every request `app` handles, so route handlers can call `req.netifly.send(...)` directly instead of importing/threading the returned `netifly` value.
+
+### `createNetiflyPublisher(options)` — `@netiflyjs/core`
+
+For processes that don't hold any WebSocket connections themselves — workers, cron jobs, serverless functions (see [Sending from workers / other languages](#-sending-from-workers--other-languages)).
+
+| Option | Type | Required | Description |
+| --- | --- | --- | --- |
+| `redisUrl` | `string` | — | Falls back to `process.env.REDIS_URL` if omitted. One of the two **must** be provided — throws at construction time if neither is set, same as `createNetifly`. |
+| `namespace` | `string` | — | Scopes Redis channel names the same way `createNetifly`'s `namespace` does — must match the value used by the `createNetifly()` server(s) this publisher should reach. Defaults to unset (no namespace). |
+
+Returns a `NetiflyPublisher` — a lighter-weight, send-only counterpart to `NetiflyInstance`, backed by a single lazily-connected Redis client (no subscriber connection, no WebSocket server):
+
+- `send<T>(userId, payload: T): Promise<SendResult>` / `send<T>(userId, type: string, data: T): Promise<SendResult>` — identical envelope/delivery semantics to `NetiflyInstance.send()` (see [Message Envelope](#-message-envelope) above for the shape, and `createNetifly`'s `send()` entry above for the `SendResult`/`delivered` caveat).
+- `isOnline(userId): Promise<boolean>` / `whoIsOnline(userIds): Promise<Record<string, boolean>>` — identical semantics/caveats to `NetiflyInstance`'s.
+- `close(): Promise<void>` — disconnects the publisher's Redis connection. Call it before a short-lived process (e.g. a serverless invocation) exits. Calling `send()`/`isOnline()`/`whoIsOnline()` after `close()` throws `Netifly: cannot use publisher after close()`.
 
 ## 🏗️ Architecture
 
